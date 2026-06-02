@@ -12,6 +12,7 @@ from PIL import Image
 from argparse import ArgumentParser
 from torchvision.transforms import Compose, Resize, ToTensor
 from sklearn.metrics import average_precision_score
+import re
 
 # EoMT repo on path
 _EOMT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'eomt')
@@ -323,7 +324,11 @@ def main():
     results_file = open(results_file_path, 'a')
 
     # Inference loop
-    image_paths = sorted(glob.glob(os.path.expanduser(args.input)))
+    def natural_sort_key(s):
+        return [int(text) if text.isdigit() else text.lower() for text in re.split('([0-9]+)', s)]
+
+    image_paths = sorted(glob.glob(os.path.expanduser(args.input)), key=natural_sort_key)
+
     if not image_paths:
         print(f"\nERROR: No images matched: {args.input}")
         results_file.close()
