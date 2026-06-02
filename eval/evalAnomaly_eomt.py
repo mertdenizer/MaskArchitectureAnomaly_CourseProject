@@ -14,7 +14,7 @@ from torch.nn import functional as F
 from torchvision.transforms import Compose, Resize, ToTensor
 from sklearn.metrics import average_precision_score
 
-
+os.makedirs('saved_logits_eomt_coco', exist_ok=True)
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'eomt'))
 
 from ood_metrics import fpr_at_95_tpr
@@ -168,6 +168,15 @@ def main():
             mask_logits = model.revert_resize_and_pad_logits_instance_panoptic(
                 mask_logits.unsqueeze(0), img_sizes
             )[0]
+
+        pixel_logits = masks_to_pixel_logits(mask_logits, class_logits)
+        dataset_name = path.split('/')[-3]
+
+        base_name = os.path.basename(path).split('.')[0]
+        filename = f"{dataset_name}_{base_name}_logits.pt"
+        
+        save_path = os.path.join('saved_logits_eomt_coco', f"{base_name}_logits.pt")
+        torch.save(pixel_logits.cpu(), save_path)
 
         if args.method == 'rba':
             anomaly_result = rba_anomaly_score(mask_logits, class_logits)
