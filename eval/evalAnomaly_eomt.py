@@ -1,99 +1,80 @@
-# eval/evalAnomaly_eomt.py — EoMT-COCO anomaly evaluation
 import os
 import sys
 import glob
 import yaml
-import torch
 import random
 import importlib
 import warnings
-import numpy as np
-from PIL import Image
-from argparse import ArgumentParser
-from torch.nn import functional as F
-from torchvision.transforms import Compose, Resize, ToTensor
-from sklearn.metrics import average_precision_score
-
-os.makedirs('saved_logits_eomt_coco', exist_ok=True)
-sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'eomt'))
-
-from ood_metrics import fpr_at_95_tpr
-from methods import msp_anomaly_score, maxlogit_anomaly_score, entropy_anomaly_score
-
-import os
-import sys
-import glob
-import random
 import torch
-import torch.nn.functional as F  # type: ignore[import]
+import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 from argparse import ArgumentParser
 from torchvision.transforms import Compose, Resize, ToTensor
 from sklearn.metrics import average_precision_score
 
-# ---------------------------------------------------------------------------
-# EoMT imports — add eomt/ to sys.path so models are importable without
-# installing the package. Works regardless of the cwd this script is run from.
-# ---------------------------------------------------------------------------
+# EoMT repo on path
 _EOMT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'eomt')
 sys.path.insert(0, _EOMT_DIR)
 
-from models.eomt import EoMT   # type: ignore[import]  # noqa: E402
-from models.vit import ViT     # type: ignore[import]  # noqa: E402
-
-# ---------------------------------------------------------------------------
-# Local imports from the same eval/ folder
-# ---------------------------------------------------------------------------
-from ood_metrics import fpr_at_95_tpr                          # noqa: E402
-from methods import (                                           # noqa: E402
+from models.eomt import EoMT
+from models.vit import ViT
+from ood_metrics import fpr_at_95_tpr 
+from methods import (                 
     msp_anomaly_score,
     maxlogit_anomaly_score,
     entropy_anomaly_score,
 )
 
-# ---------------------------------------------------------------------------
-# Reproducibility (matches evalAnomaly.py)
-# ---------------------------------------------------------------------------
+# Reproducibility
 seed = 42
 random.seed(seed)
 np.random.seed(seed)
 torch.manual_seed(seed)
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = True
 
-# Device 
-if torch.cuda.is_available():
-    device = torch.device('cuda')
-elif torch.backends.mps.is_available():
-    device = torch.device('mps')
-else:
-    device = torch.device('cpu')
-print(f"Using device: {device}")
+# Cityscapes-specific constants
+CS_NUM_CLASSES    = 19
+CS_NUM_QUERIES    = 100
+CS_NUM_BLOCKS     = 3
+CS_BACKBONE_NAME  = "vit_base_patch14_reg4_dinov2"
+CS_TRAIN_IMG_SIZE = (1024, 1024)
+CS_EVAL_IMG_SIZE  = (1024, 1024)
 
-# Transforms
-input_transform = Compose([
-    Resize((512, 1024), Image.BILINEAR),
-    ToTensor(),
-])
-target_transform = Compose([
-    Resize((512, 1024), Image.NEAREST),
-])
+# Shared transforms — each model loader overrides eval size if needed
+def make_transforms(eval_size):
+    return (
+        Compose([Resize(eval_size, Image.BILINEAR), ToTensor()]),
+        Compose([Resize(eval_size, Image.NEAREST)]),
+    )
 
+# Device helper
+def get_device(cpu_flag: bool) -> torch.device:
+    if cpu_flag:
+        return torch.device('cpu')
+    if torch.cuda.is_available():
+        return torch.device('cuda')
+    if torch.backends.mps.is_available():
+        return torch.device('mps')
+    return torch.device('cpu')
 
-#Loading EoMT model (based on inference.ipynb) 
-def load_eomt(config_path):
+# COCO model loader  (Person 2)
+def load_eomt_coco(config_path, device):
+    """Load EoMT pretrained on COCO panoptic via HuggingFace Hub."""
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
     encoder_cfg = config["model"]["init_args"]["network"]["init_args"]["encoder"]
     encoder_module_name, encoder_class_name = encoder_cfg["class_path"].rsplit(".", 1)
     encoder_cls = getattr(importlib.import_module(encoder_module_name), encoder_class_name)
-    
+
     img_size = config["model"]["init_args"].get("img_size", 640)
-    encoder = encoder_cls(img_size=img_size, **encoder_cfg.get("init_args", {}))
+    encoder  = encoder_cls(img_size=img_size, **encoder_cfg.get("init_args", {}))
 
     network_cfg = config["model"]["init_args"]["network"]
     network_module_name, network_class_name = network_cfg["class_path"].rsplit(".", 1)
-    network_cls = getattr(importlib.import_module(network_module_name), network_class_name)
+    network_cls    = getattr(importlib.import_module(network_module_name), network_class_name)
     network_kwargs = {k: v for k, v in network_cfg["init_args"].items() if k != "encoder"}
     network = network_cls(
         masked_attn_enabled=False,
@@ -103,7 +84,7 @@ def load_eomt(config_path):
     )
 
     lit_module_name, lit_class_name = config["model"]["class_path"].rsplit(".", 1)
-    lit_cls = getattr(importlib.import_module(lit_module_name), lit_class_name)
+    lit_cls     = getattr(importlib.import_module(lit_module_name), lit_class_name)
     model_kwargs = {k: v for k, v in config["model"]["init_args"].items() if k != "network"}
 
     if "Panoptic" in lit_class_name:
@@ -123,7 +104,6 @@ def load_eomt(config_path):
 
     from huggingface_hub import hf_hub_download
     name = config.get("trainer", {}).get("logger", {}).get("init_args", {}).get("name")
-
     if name == "coco_panoptic_eomt_base_640":
         name = "coco_panoptic_eomt_base_640_2x"
     if name:
@@ -136,439 +116,318 @@ def load_eomt(config_path):
             model_kwargs["ckpt_path"] = state_dict_path
             model_kwargs["delta_weights"] = True
         else:
-            state_dict = torch.load(state_dict_path,
-                                    map_location=f"cuda:{device}" if device.type == "cuda" else device,
-                                    weights_only=True)
+            state_dict = torch.load(
+                state_dict_path,
+                map_location=f"cuda:{device}" if device.type == "cuda" else device,
+                weights_only=True,
+            )
             model.load_state_dict(state_dict, strict=False)
 
     return model, img_size
 
 
-#Convert EoMT output to pixel logits [C, H, W] 
-def masks_to_pixel_logits(mask_logits, class_logits):
-    """
-    Implements: sum_i p_i(c) * m_i[h,w]  (from the notebook's formula)
-    mask_logits:   [N, H, W]  raw mask logits
-    class_logits:  [N, C]     class logits per query
-    returns:       [C, H, W]  pixel-level logits
-    """
-    mask_probs  = mask_logits.sigmoid()         
-    class_probs = class_logits.softmax(dim=-1)  
-    pixel_logits = torch.einsum('nc,nhw->chw', class_probs, mask_probs)
-    return pixel_logits  
-
-
-def rba_anomaly_score(mask_logits, class_logits):
-    mask_probs       = mask_logits.sigmoid()                    
-    class_confidence = class_logits.softmax(-1).max(-1).values   
-    weighted = class_confidence[:, None, None] * mask_probs      
-    rba = 1.0 - weighted.max(dim=0).values                       
-    return rba.cpu().numpy()
-
-
-def main():
-    parser = ArgumentParser()
-    parser.add_argument('--input', required=True,
-                        help="Glob e.g. '../Validation_Dataset/RoadAnomaly21/images/*.png'")
-    parser.add_argument('--config', required=True,
-                        help="Path to EoMT YAML config")
-    parser.add_argument('--method', default='msp',
-                        choices=['msp', 'maxlogit', 'entropy', 'rba'])
-    args = parser.parse_args()
-
-    print(f"Loading EoMT model...")
-    model, img_size = load_eomt(args.config)
-    print(f"Method: {args.method.upper()}")
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = True
-
-# ---------------------------------------------------------------------------
-# Constants — must match the Cityscapes-semantic checkpoint.
-# Source: eomt/configs/dinov2/cityscapes/semantic/eomt_base_640.yaml
-# ---------------------------------------------------------------------------
-NUM_CLASSES   = 19           # Cityscapes classes (void handled separately in class_head)
-NUM_QUERIES   = 100          # num_q in config
-NUM_BLOCKS    = 3            # num_blocks in config
-BACKBONE_NAME = "vit_base_patch14_reg4_dinov2"
-TRAIN_IMG_SIZE = (1024, 1024)  # derived from CityscapesSemantic.img_size default (no override in YAML);
-                                # linked via main.py:133 to encoder.init_args.img_size
-EVAL_IMG_SIZE  = (1024, 1024) # anomaly dataset inference resolution
-
-# ---------------------------------------------------------------------------
-# Transforms (identical to evalAnomaly.py).
-# ToTensor() → [0, 1] float; EoMT normalises internally via pixel_mean/pixel_std.
-# ---------------------------------------------------------------------------
-input_transform = Compose([
-    Resize(EVAL_IMG_SIZE, Image.BILINEAR),
-    ToTensor(),
-])
-
-target_transform = Compose([
-    Resize(EVAL_IMG_SIZE, Image.NEAREST),
-])
-
-
-# ---------------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------------
-def get_device(cpu_flag: bool) -> torch.device:
-    if cpu_flag:
-        return torch.device('cpu')
-    if torch.cuda.is_available():
-        return torch.device('cuda')
-    if torch.backends.mps.is_available():
-        return torch.device('mps')
-    return torch.device('cpu')
-
-
-def build_eomt() -> EoMT:
-    """
-    Build the EoMT-base skeleton that matches the Cityscapes checkpoint.
-
-    Parameters are derived from the YAML config + Python defaults — NOT guessed:
-      img_size   = (1024, 1024)  CityscapesSemantic default; linked to ViT via main.py
-      patch_size = 16            ViT.__init__ default; YAML has no patch_size key
-      backbone   = vit_base_patch14_reg4_dinov2  (just the pretrained name; patch14
-                                  refers to the original DINOv2 pretraining, not what
-                                  is used here — timm rebuilds patch_embed with patch_size=16)
-
-    ckpt_path='placeholder' sets pretrained=False in timm, skipping the DINOv2
-    download. All weights come from the checkpoint loaded in load_eomt_checkpoint().
-    """
+# Cityscapes model loader  (Person 3)
+def build_eomt_cityscapes() -> EoMT:
     encoder = ViT(
-        img_size=TRAIN_IMG_SIZE,   # (1024, 1024)
-        patch_size=16,             # explicit — ViT default, not overridden in YAML
-        backbone_name=BACKBONE_NAME,
+        img_size=CS_TRAIN_IMG_SIZE,
+        patch_size=16,
+        backbone_name=CS_BACKBONE_NAME,
         ckpt_path='placeholder',
     )
     return EoMT(
         encoder=encoder,
-        num_classes=NUM_CLASSES,
-        num_q=NUM_QUERIES,
-        num_blocks=NUM_BLOCKS,
+        num_classes=CS_NUM_CLASSES,
+        num_q=CS_NUM_QUERIES,
+        num_blocks=CS_NUM_BLOCKS,
     )
 
 
-def load_eomt_checkpoint(model: EoMT, ckpt_path: str) -> EoMT:
-    """
-    Load an EoMT-Cityscapes checkpoint into the model.
-
-    Handles the formats produced by LightningModule._load_ckpt / on_save_checkpoint:
-      - Flat state dict with 'network.' prefix  (pytorch_model.bin style)
-      - Nested Lightning .ckpt with 'state_dict' key
-    Filters 'criterion.*' and 'metrics.*' keys which are not part of EoMT.
-    """
-    print(f"Loading checkpoint: {ckpt_path}")
-
-    # Match _load_ckpt in lightning_module.py (weights_only=True is safe default).
-    # Fall back to False for checkpoints saved with older PyTorch.
+def load_eomt_cityscapes(ckpt_path: str, device: torch.device) -> EoMT:
+    model = build_eomt_cityscapes()
+    print(f"Loading Cityscapes checkpoint: {ckpt_path}")
     try:
         raw = torch.load(ckpt_path, map_location='cpu', weights_only=True)
     except Exception:
         print("  weights_only=True failed — retrying with weights_only=False.")
         raw = torch.load(ckpt_path, map_location='cpu', weights_only=False)
 
-    # Unwrap nested Lightning .ckpt format
     if isinstance(raw, dict) and 'state_dict' in raw:
         print("  Lightning .ckpt detected — extracting state_dict.")
         raw = raw['state_dict']
 
-    # Drop keys that don't belong in EoMT at inference time
     raw = {k: v for k, v in raw.items()
-           if not k.startswith('criterion.')
-           and not k.startswith('metrics.')}
+           if not k.startswith('criterion.') and not k.startswith('metrics.')}
 
-    # Strip the 'network.' prefix added by MaskClassificationSemantic
-    # (which stores EoMT as self.network).
     sample = list(raw.keys())[:5]
     if sample and all(k.startswith('network.') for k in sample):
-        print("  Stripping 'network.' prefix from keys.")
+        print("  Stripping 'network.' prefix.")
         raw = {k[len('network.'):]: v for k, v in raw.items()}
 
     result = model.load_state_dict(raw, strict=False)
-
-    # attn_mask_probs is a training buffer registered in EoMT; it should be
-    # in the checkpoint and load normally. Only warn about truly missing keys.
     real_missing = [k for k in result.missing_keys if 'attn_mask_probs' not in k]
     if real_missing:
-        print(f"  WARNING — {len(real_missing)} missing keys "
-              f"(first 5): {real_missing[:5]}")
+        print(f"  WARNING — {len(real_missing)} missing keys (first 5): {real_missing[:5]}")
     else:
         print("  Checkpoint loaded successfully.")
 
-    return model
+    return model.to(device).eval()
 
 
-def eomt_to_pixel_logits(
-    mask_logits_per_layer: list,
-    class_logits_per_layer: list,
-    target_hw: tuple,
-) -> torch.Tensor:
+# Shared projection helpers
+def coco_masks_to_pixel_logits(mask_logits, class_logits):
     """
-    Convert EoMT output into per-pixel class logits for anomaly scoring.
-
-    Uses the last layer only (best quality prediction).
-
-    Mirrors LightningModule.to_per_pixel_logits_semantic (lightning_module.py:668):
-        pixel_logits = einsum("bqhw, bqc -> bchw",
-                              mask_logits.sigmoid(),
-                              class_logits.softmax(dim=-1)[..., :-1])
-
-    [..:-1] removes the void/no-object class (class_head outputs NUM_CLASSES+1).
-    mask_logits is resized to target_hw before the einsum, matching the official
-    eval_step which does F.interpolate before calling to_per_pixel_logits_semantic.
-
-    Returns:
-        pixel_logits: [B, NUM_CLASSES, H, W] float tensor
+    Person 2 projection for COCO model (LightningModule wrapper).
+    mask_logits:  [N, H, W]  raw mask logits
+    class_logits: [N, C]     class logits per query
+    returns:      [C, H, W]  pixel-level logits
     """
-    mask_logits  = mask_logits_per_layer[-1]    # [B, Q, H', W']
-    class_logits = class_logits_per_layer[-1]   # [B, Q, C+1]
+    mask_probs   = mask_logits.sigmoid()
+    class_probs  = class_logits.softmax(dim=-1)
+    return torch.einsum('nc,nhw->chw', class_probs, mask_probs)
 
-    # Resize masks before combining — cheaper than resizing pixel_logits
-    # (100 query channels vs 19 class channels).
+
+def cityscapes_masks_to_pixel_logits(mask_logits_per_layer, class_logits_per_layer, target_hw):
+    """
+    Person 3 projection for Cityscapes model (raw EoMT).
+    Mirrors LightningModule.to_per_pixel_logits_semantic.
+    Returns: [B, C, H, W]
+    """
+    mask_logits  = mask_logits_per_layer[-1]
+    class_logits = class_logits_per_layer[-1]
+
     mask_logits_r = F.interpolate(
-        mask_logits,
-        size=target_hw,
-        mode='bilinear',
-        align_corners=False,
-    )  # [B, Q, H, W]
-
-    pixel_logits = torch.einsum(
+        mask_logits, size=target_hw, mode='bilinear', align_corners=False
+    )
+    return torch.einsum(
         "bqhw, bqc -> bchw",
         mask_logits_r.sigmoid(),
         class_logits.softmax(dim=-1)[..., :-1],
-    )  # [B, C, H, W]
-
-    return pixel_logits
+    )
 
 
-# ---------------------------------------------------------------------------
+def rba_anomaly_score_coco(mask_logits, class_logits):
+    """
+    RbA for the COCO model (LightningModule panoptic output).
+    mask_logits:  [N, H, W]  raw mask logits (already resized + un-padded)
+    class_logits: [N, C]     class logits per query
+    A pixel is anomalous if no mask confidently claims it.
+    Score = 1 - max_n( sigmoid(mask_n[h,w]) * max_c softmax(class_n) )
+    """
+    mask_probs       = mask_logits.sigmoid()                     # [N, H, W]
+    class_confidence = class_logits.softmax(-1).max(-1).values   # [N]
+    weighted         = class_confidence[:, None, None] * mask_probs  # [N, H, W]
+    return (1.0 - weighted.max(dim=0).values).cpu().numpy()      # [H, W]
+
+
+def rba_anomaly_score_cityscapes(mask_logits_per_layer, class_logits_per_layer, target_hw):
+    """
+    RbA for the Cityscapes model (raw EoMT output).
+    Uses the last decoder layer only (best quality).
+
+    The Cityscapes class head outputs C+1 logits (last = void/no-object class).
+    We exclude the void class from the confidence calculation — a mask that
+    confidently predicts 'void' should NOT suppress the anomaly score, because
+    void predictions are exactly what happens on OoD pixels.
+
+    Score = 1 - max_n( sigmoid(mask_n[h,w]) * max_{c != void} softmax(class_n)[c] )
+    """
+    mask_logits  = mask_logits_per_layer[-1]   # [B, Q, H', W']
+    class_logits = class_logits_per_layer[-1]  # [B, Q, C+1]
+
+    # Resize masks to target resolution before combining
+    mask_logits_r = F.interpolate(
+        mask_logits, size=target_hw, mode='bilinear', align_corners=False
+    ).squeeze(0)  # [Q, H, W]
+
+    # Exclude void class ([..., :-1]) then take max in-class confidence per query
+    class_probs      = class_logits.softmax(dim=-1)[..., :-1]  # [B, Q, C]
+    class_confidence = class_probs.squeeze(0).max(dim=-1).values  # [Q]
+
+    weighted = class_confidence[:, None, None] * mask_logits_r.sigmoid()  # [Q, H, W]
+    return (1.0 - weighted.max(dim=0).values).cpu().numpy()               # [H, W]
+
+
+# GT mask loading
+def load_gt_mask(path, target_transform):
+    pathGT = path.replace("images", "labels_masks")
+    if "RoadObsticle21" in pathGT:
+        pathGT = pathGT.replace("webp", "png")
+    if "fs_static" in pathGT:
+        pathGT = pathGT.replace("jpg", "png")
+    if "RoadAnomaly" in pathGT:
+        pathGT = pathGT.replace("jpg", "png")
+
+    mask    = Image.open(pathGT)
+    mask    = target_transform(mask)
+    ood_gts = np.array(mask)
+
+    if "RoadAnomaly" in pathGT:
+        ood_gts = np.where((ood_gts == 2), 1, ood_gts)
+    if "LostAndFound" in pathGT:
+        ood_gts = np.where((ood_gts == 0), 255, ood_gts)
+        ood_gts = np.where((ood_gts == 1), 0, ood_gts)
+        ood_gts = np.where((ood_gts > 1) & (ood_gts < 201), 1, ood_gts)
+    if "Streethazard" in pathGT:
+        ood_gts = np.where((ood_gts == 14), 255, ood_gts)
+        ood_gts = np.where((ood_gts < 20), 0, ood_gts)
+        ood_gts = np.where((ood_gts == 255), 1, ood_gts)
+
+    return ood_gts
+
+
 # Main
-# ---------------------------------------------------------------------------
 def main():
     parser = ArgumentParser(
-        description="Anomaly segmentation evaluation for EoMT-Cityscapes. "
-                    "Run from the eval/ directory with the eomt conda env active."
+        description="Unified EoMT anomaly evaluation (COCO or Cityscapes)."
     )
-    parser.add_argument(
-        '--input',
-        default='/path/to/RoadAnomaly21/images/*.png',
-        nargs='+',
-        help="Glob pattern for input images, "
-             "e.g. '/data/RoadAnomaly21/images/*.png'",
-    )
-    parser.add_argument(
-        '--checkpoint',
-        default='../eomt/checkpoints/eomt_cityscapes.bin',
-        help="Path to the EoMT Cityscapes checkpoint (.bin / .ckpt / .pth)",
-    )
-    parser.add_argument(
-        '--method',
-        default='maxlogit',
-        choices=['msp', 'maxlogit', 'entropy'],
-        help="Anomaly scoring method: msp | maxlogit | entropy",
-    )
-    parser.add_argument(
-        '--cpu',
-        action='store_true',
-        help="Force CPU inference (avoids MPS/CUDA issues if needed)",
-    )
+    parser.add_argument('--model', required=True, choices=['coco', 'cityscapes'],
+                        help="Which EoMT checkpoint to use")
+    # COCO-specific
+    parser.add_argument('--config', default=None,
+                        help="[coco only] Path to EoMT YAML config")
+    # Cityscapes-specific
+    parser.add_argument('--checkpoint', default=None,
+                        help="[cityscapes only] Path to .bin/.ckpt checkpoint")
+    # Shared
+    parser.add_argument('--input', required=True,
+                        help="Glob for input images, e.g. '...RoadAnomaly21/images/*.png'")
+    parser.add_argument('--method', default='maxlogit',
+                        choices=['msp', 'maxlogit', 'entropy', 'rba'],
+                        help="Anomaly scoring method (rba: coco only)")
+    parser.add_argument('--cpu', action='store_true', help="Force CPU inference")
     args = parser.parse_args()
 
-    method_map = {
-        'msp':      msp_anomaly_score,
-        'maxlogit': maxlogit_anomaly_score,
-        'entropy':  entropy_anomaly_score,
-    }
-    score_fn = method_map[args.method]
-    print(f"Anomaly scoring method : {args.method.upper()}")
-
+    # Validate argument combinations
+    if args.model == 'coco' and args.config is None:
+        parser.error("--config is required when --model coco")
+    if args.model == 'cityscapes' and args.checkpoint is None:
+        parser.error("--checkpoint is required when --model cityscapes")
     device = get_device(args.cpu)
-    print(f"Device                 : {device}")
+    print(f"Model   : EoMT-{args.model.upper()}")
+    print(f"Method  : {args.method.upper()}")
+    print(f"Device  : {device}")
 
-    # --- Build and load model ---
-    print("Building EoMT-Cityscapes model skeleton...")
-    model = build_eomt()
-    model = load_eomt_checkpoint(model, args.checkpoint)
-    model = model.to(device)
-    model.eval()
+    # Load model + set up transforms
+    if args.model == 'coco':
+        os.makedirs('saved_logits_eomt_coco', exist_ok=True)
+        model, img_size = load_eomt_coco(args.config, device)
+        eval_size       = (img_size, img_size)
+        results_file_path = 'results_eomt_coco.txt'
+    else:
+        model     = load_eomt_cityscapes(args.checkpoint, device)
+        eval_size = CS_EVAL_IMG_SIZE
+        results_file_path = 'results_eomt_cityscapes.txt'
 
-    # --- Separate results file (does not overwrite ERFNet results.txt) ---
-    results_path = 'results_eomt.txt'
-    if not os.path.exists(results_path):
-        open(results_path, 'w').close()
-    results_file = open(results_path, 'a')
+    input_transform, target_transform = make_transforms(eval_size)
 
-    anomaly_score_list = []
-    ood_gts_list = []
+    results_file = open(results_file_path, 'a')
 
-    for path in sorted(glob.glob(os.path.expanduser(args.input))):
-        print(f"  {path}")
-        img = Image.open(path).convert('RGB')
-        imgs = [(input_transform(img) * 255).to(torch.uint8).to(device)]
-        img_sizes = [imgs[0].shape[-2:]]
-
-        with torch.no_grad():
-            transformed = model.resize_and_pad_imgs_instance_panoptic(imgs)
-            mask_logits_per_layer, class_logits_per_layer = model(transformed)
-
-            mask_logits = F.interpolate(
-                mask_logits_per_layer[-1],
-                size=img_sizes[0],
-                mode='bilinear'
-            ).squeeze(0)
-            class_logits = class_logits_per_layer[-1].squeeze(0) 
-
-            mask_logits = model.revert_resize_and_pad_logits_instance_panoptic(
-                mask_logits.unsqueeze(0), img_sizes
-            )[0]
-
-        pixel_logits = masks_to_pixel_logits(mask_logits, class_logits)
-        dataset_name = path.split('/')[-3]
-
-        base_name = os.path.basename(path).split('.')[0]
-        filename = f"{dataset_name}_{base_name}_logits.pt"
-        
-        save_path = os.path.join('saved_logits_eomt_coco', f"{base_name}_logits.pt")
-        torch.save(pixel_logits.cpu(), save_path)
-
-        if args.method == 'rba':
-            anomaly_result = rba_anomaly_score(mask_logits, class_logits)
-        else:
-            pixel_logits = masks_to_pixel_logits(mask_logits, class_logits)
-            logits_np = pixel_logits.cpu().numpy()
-            if args.method == 'msp':
-                anomaly_result = msp_anomaly_score(logits_np)
-            elif args.method == 'maxlogit':
-                anomaly_result = maxlogit_anomaly_score(logits_np)
-            elif args.method == 'entropy':
-                anomaly_result = entropy_anomaly_score(logits_np)
-
-
-    # --- Inference loop ---
-    image_paths = sorted(glob.glob(os.path.expanduser(str(args.input[0]))))
+    # Inference loop
+    image_paths = sorted(glob.glob(os.path.expanduser(args.input)))
     if not image_paths:
-        print(f"\nERROR: No images matched: {args.input[0]}")
-        print("  Make sure to quote the glob pattern, e.g.:")
-        print("  python evalAnomaly_eomt.py --input '/data/RoadAnomaly21/images/*.png'")
+        print(f"\nERROR: No images matched: {args.input}")
         results_file.close()
         return
+    print(f"Found {len(image_paths)} images.")
 
-    print(f"Found {len(image_paths)} images. Starting inference...")
+    anomaly_score_list = []
+    ood_gts_list       = []
 
     for path in image_paths:
-        print(path)
-
+        print(f"  {path}")
         img = Image.open(path).convert('RGB')
-        tensor_img = input_transform(img).unsqueeze(0).float().to(device)
 
-        with torch.no_grad():
-            mask_logits_per_layer, class_logits_per_layer = model(tensor_img)
+        if args.model == 'coco':
+            imgs      = [(input_transform(img) * 255).to(torch.uint8).to(device)]
+            img_sizes = [imgs[0].shape[-2:]]
+            with torch.no_grad():
+                transformed = model.resize_and_pad_imgs_instance_panoptic(imgs)
+                mask_logits_per_layer, class_logits_per_layer = model(transformed)
+                mask_logits  = F.interpolate(
+                    mask_logits_per_layer[-1], size=img_sizes[0], mode='bilinear'
+                ).squeeze(0)
+                class_logits = class_logits_per_layer[-1].squeeze(0)
+                mask_logits  = model.revert_resize_and_pad_logits_instance_panoptic(
+                    mask_logits.unsqueeze(0), img_sizes
+                )[0]
 
-        pixel_logits = eomt_to_pixel_logits(
-            mask_logits_per_layer,
-            class_logits_per_layer,
-            target_hw=EVAL_IMG_SIZE,
-        )  # [1, 19, 512, 1024]
+            # Save logits (temperature scaling)
+            dataset_name = path.split('/')[-3]
+            base_name = os.path.basename(path).split('.')[0]
+            pixel_logits_save = coco_masks_to_pixel_logits(mask_logits, class_logits)
+            torch.save(pixel_logits_save.cpu(),
+                       os.path.join('saved_logits_eomt_coco', f"{dataset_name}_{base_name}_logits.pt"))
 
-        logits_np = pixel_logits.squeeze(0).cpu().numpy()  # [19, 512, 1024]
-        anomaly_result = score_fn(logits_np)                # [512, 1024]
+            if args.method == 'rba':
+                anomaly_result = rba_anomaly_score_coco(mask_logits, class_logits)
+            else:
+                pixel_logits   = coco_masks_to_pixel_logits(mask_logits, class_logits)
+                logits_np      = pixel_logits.cpu().numpy()
+                anomaly_result = {
+                    'msp':      msp_anomaly_score,
+                    'maxlogit': maxlogit_anomaly_score,
+                    'entropy':  entropy_anomaly_score,
+                }[args.method](logits_np)
 
-        # --- GT mask loading (identical to evalAnomaly.py) ---
-        pathGT = path.replace("images", "labels_masks")
-        if "RoadObsticle21" in pathGT:
-            pathGT = pathGT.replace("webp", "png")
-        if "fs_static" in pathGT:
-            pathGT = pathGT.replace("jpg", "png")
-        if "RoadAnomaly" in pathGT:
-            pathGT = pathGT.replace("jpg", "png")
+        else:  # cityscapes
+            tensor_img = input_transform(img).unsqueeze(0).float().to(device)
+            with torch.no_grad():
+                mask_logits_per_layer, class_logits_per_layer = model(tensor_img)
 
-        mask = Image.open(pathGT)
-        mask = target_transform(mask)
-        ood_gts = np.array(mask)
+            if args.method == 'rba':
+                anomaly_result = rba_anomaly_score_cityscapes(
+                    mask_logits_per_layer, class_logits_per_layer, target_hw=eval_size
+                )
+            else:
+                pixel_logits   = cityscapes_masks_to_pixel_logits(
+                    mask_logits_per_layer, class_logits_per_layer, target_hw=eval_size
+                )
+                logits_np      = pixel_logits.squeeze(0).cpu().numpy()
+                anomaly_result = {
+                    'msp':      msp_anomaly_score,
+                    'maxlogit': maxlogit_anomaly_score,
+                    'entropy':  entropy_anomaly_score,
+                }[args.method](logits_np)
 
-        if "RoadAnomaly" in pathGT:
-            ood_gts = np.where((ood_gts == 2), 1, ood_gts)
-        if "LostAndFound" in pathGT:
-            ood_gts = np.where((ood_gts == 0), 255, ood_gts)
-            ood_gts = np.where((ood_gts == 1), 0, ood_gts)
-            ood_gts = np.where((ood_gts > 1) & (ood_gts < 201), 1, ood_gts)
-        if "Streethazard" in pathGT:
-            ood_gts = np.where((ood_gts == 14), 255, ood_gts)
-            ood_gts = np.where((ood_gts < 20), 0, ood_gts)
-            ood_gts = np.where((ood_gts == 255), 1, ood_gts)
-
+        # GT mask
+        ood_gts = load_gt_mask(path, target_transform)
         if 1 not in np.unique(ood_gts):
             continue
 
         ood_gts_list.append(ood_gts)
         anomaly_score_list.append(anomaly_result)
 
-        if device.type == 'mps':
-            torch.mps.empty_cache()
-
-    ood_gts     = np.array(ood_gts_list)
-    anom_scores = np.array(anomaly_score_list)
-
-    ood_out   = anom_scores[ood_gts == 1]
-    ind_out   = anom_scores[ood_gts == 0]
-    val_out   = np.concatenate([ind_out, ood_out])
-    val_label = np.concatenate([np.zeros(len(ind_out)), np.ones(len(ood_out))])
-
-    auprc = average_precision_score(val_label, val_out)
-    fpr   = fpr_at_95_tpr(val_out, val_label)
-
-    print(f"\n=== EoMT-COCO [{args.method.upper()}] ===")
-    print(f"AUPRC:   {auprc * 100:.2f}%")
-    print(f"FPR@95:  {fpr   * 100:.2f}%")
-
-    with open('results_eomt_coco.txt', 'a') as f:
-        f.write(f"[{args.method.upper()}] AUPRC: {auprc*100:.2f}  FPR@95: {fpr*100:.2f}  | {args.input}\n")
-
-
-if __name__ == '__main__':
-    main()
-        del mask_logits_per_layer, class_logits_per_layer, pixel_logits
-        del anomaly_result, ood_gts, mask
-
+        # Memory cleanup
         if device.type == 'cuda':
             torch.cuda.empty_cache()
         elif device.type == 'mps':
             torch.mps.empty_cache()
 
     if not anomaly_score_list:
-        print("\nERROR: No valid images were processed.")
-        print("  Check that labels_masks/ exists next to images/ with matching filenames.")
+        print("\nERROR: No valid images processed.")
         results_file.close()
         return
 
-    # --- Metrics (identical to evalAnomaly.py) ---
-    ood_gts = np.array(ood_gts_list)
+    # Metrics
+    ood_gts        = np.array(ood_gts_list)
     anomaly_scores = np.array(anomaly_score_list)
 
-    ood_mask = (ood_gts == 1)
-    ind_mask = (ood_gts == 0)
+    ood_out   = anomaly_scores[ood_gts == 1]
+    ind_out   = anomaly_scores[ood_gts == 0]
+    val_out   = np.concatenate([ind_out, ood_out])
+    val_label = np.concatenate([np.zeros(len(ind_out)), np.ones(len(ood_out))])
 
-    ood_out = anomaly_scores[ood_mask]
-    ind_out = anomaly_scores[ind_mask]
+    auprc = average_precision_score(val_label, val_out)
+    fpr   = fpr_at_95_tpr(val_out, val_label)
 
-    ood_label = np.ones(len(ood_out))
-    ind_label = np.zeros(len(ind_out))
+    tag = f"EoMT-{args.model.upper()}"
+    print(f"\n=== {tag} [{args.method.upper()}] ===")
+    print(f"AUPRC  : {auprc * 100:.2f}%")
+    print(f"FPR@95 : {fpr   * 100:.2f}%")
 
-    val_out   = np.concatenate((ind_out, ood_out))
-    val_label = np.concatenate((ind_label, ood_label))
-
-    prc_auc = average_precision_score(val_label, val_out)
-    fpr     = fpr_at_95_tpr(val_out, val_label)
-
-    print(f'\nAUPRC score : {prc_auc * 100.0:.4f}')
-    print(f'FPR@TPR95   : {fpr * 100.0:.4f}')
-
-    results_file.write('\n')
     results_file.write(
-        f'    [EoMT-Cityscapes][{args.method.upper()}]'
-        f'  AUPRC score:{prc_auc * 100.0}'
-        f'   FPR@TPR95:{fpr * 100.0}'
+        f"[{args.method.upper()}] AUPRC: {auprc*100:.2f}  FPR@95: {fpr*100:.2f}"
+        f"  | {args.input}\n"
     )
     results_file.close()
 
