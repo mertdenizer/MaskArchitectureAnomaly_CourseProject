@@ -19,7 +19,7 @@ def is_image(filename):
     return any(filename.endswith(ext) for ext in EXTENSIONS)
 
 def is_label(filename):
-    return filename.endswith("_labelTrainIds.png")
+    return filename.endswith("_gtFine_labelIds.png")
 
 def image_path(root, basename, extension):
     return os.path.join(root, f'{basename}{extension}')
@@ -69,10 +69,10 @@ class cityscapes(Dataset):
         self.images_root = os.path.join(root, 'leftImg8bit/' + subset)
         self.labels_root = os.path.join(root, 'gtFine/' + subset)
         print(self.images_root, self.labels_root)
-        self.filenames = [os.path.join(dp, f) for dp, dn, fn in os.walk(os.path.expanduser(self.images_root)) for f in fn if is_image(f)]
+        self.filenames = [os.path.relpath(os.path.join(dp, f), self.images_root) for dp, dn, fn in os.walk(os.path.expanduser(self.images_root)) for f in fn if is_image(f)]
         self.filenames.sort()
 
-        self.filenamesGt = [os.path.join(dp, f) for dp, dn, fn in os.walk(os.path.expanduser(self.labels_root)) for f in fn if is_label(f)]
+        self.filenamesGt = [os.path.relpath(os.path.join(dp, f), self.labels_root) for dp, dn, fn in os.walk(os.path.expanduser(self.labels_root)) for f in fn if is_label(f)]
         self.filenamesGt.sort()
 
         self.input_transform = input_transform
