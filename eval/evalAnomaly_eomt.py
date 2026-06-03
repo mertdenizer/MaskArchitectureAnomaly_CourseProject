@@ -177,19 +177,18 @@ def load_eomt_cityscapes(ckpt_path: str, device: torch.device) -> EoMT:
 # Shared projection helpers
 def coco_masks_to_pixel_logits(mask_logits, class_logits):
     """
-    Person 2 projection for COCO model (LightningModule wrapper).
+    Projection for COCO model (LightningModule wrapper).
     mask_logits:  [N, H, W]  raw mask logits
     class_logits: [N, C]     class logits per query
     returns:      [C, H, W]  pixel-level logits
     """
-    mask_probs   = mask_logits.sigmoid()
-    class_probs  = class_logits.softmax(dim=-1)
-    return torch.einsum('nc,nhw->chw', class_probs, mask_probs)
+    mask_probs = mask_logits.sigmoid()
+    return torch.einsum('nc,nhw->chw', class_logits, mask_probs)
 
 
 def cityscapes_masks_to_pixel_logits(mask_logits_per_layer, class_logits_per_layer, target_hw):
     """
-    Person 3 projection for Cityscapes model (raw EoMT).
+    Projection for Cityscapes model (raw EoMT).
     Mirrors LightningModule.to_per_pixel_logits_semantic.
     Returns: [B, C, H, W]
     """
@@ -238,17 +237,14 @@ def rba_anomaly_score_cityscapes(mask_logits_per_layer, class_logits_per_layer, 
     # Resize masks to target resolution before combining
     mask_logits_r = F.interpolate(
         mask_logits, size=target_hw, mode='bilinear', align_corners=False
-    ).squeeze(0)  # [Q, H, W]
-
-    # Exclude void class ([..., :-1]) then take max in-class confidence per query
-    class_probs      = class_logits.softmax(dim=-1)[..., :-1]  # [B, Q, C]
-    class_confidence = class_probs.squeeze(0).max(dim=-1).values  # [Q]
-
-    weighted = class_confidence[:, None, None] * mask_logits_r.sigmoid()  # [Q, H, W]
-    return (1.0 - weighted.max(dim=0).values).cpu().numpy()               # [H, W]
+    ).squeeze(0)
+        
+    class_confidence = class_logits[0, :, :-1].softmax(-1).max(-1).values
+    weighted = class_confidence[:, None, None] * mask_logits_r.sigmoid() 
+    
+    return (1.0 - weighted.max(dim=0).values).cpu().numpy()  
 
 
-# GT mask loading
 def load_gt_mask(path, target_transform):
     pathGT = path.replace("images", "labels_masks")
     if "RoadObsticle21" in pathGT:
@@ -310,7 +306,6 @@ def main():
 
     # Load model + set up transforms
     if args.model == 'coco':
-        os.makedirs('saved_logits_eomt_coco', exist_ok=True)
         model, img_size = load_eomt_coco(args.config, device)
         eval_size       = (img_size, img_size)
         results_file_path = 'results_eomt_coco.txt'
@@ -343,8 +338,12 @@ def main():
         img = Image.open(path).convert('RGB')
 
         if args.model == 'coco':
-            imgs      = [(input_transform(img) * 255).to(torch.uint8).to(device)]
+            original_size = img.size[::-1]
+
+            imgs = [(input_transform(img) * 255).to(torch.uint8).to(device)]
             img_sizes = [imgs[0].shape[-2:]]
+                        
+                    
             with torch.no_grad():
                 transformed = model.resize_and_pad_imgs_instance_panoptic(imgs)
                 mask_logits_per_layer, class_logits_per_layer = model(transformed)
@@ -356,18 +355,11 @@ def main():
                     mask_logits.unsqueeze(0), img_sizes
                 )[0]
 
-            # Save logits (temperature scaling)
-            dataset_name = path.split('/')[-3]
-            base_name = os.path.basename(path).split('.')[0]
-            pixel_logits_save = coco_masks_to_pixel_logits(mask_logits, class_logits)
-            torch.save(pixel_logits_save.cpu(),
-                       os.path.join('saved_logits_eomt_coco', f"{dataset_name}_{base_name}_logits.pt"))
-
             if args.method == 'rba':
                 anomaly_result = rba_anomaly_score_coco(mask_logits, class_logits)
             else:
                 pixel_logits   = coco_masks_to_pixel_logits(mask_logits, class_logits)
-                logits_np      = pixel_logits.cpu().numpy()
+                logits_np      = pixel_logits[:133].cpu().numpy()
                 anomaly_result = {
                     'msp':      msp_anomaly_score,
                     'maxlogit': maxlogit_anomaly_score,
@@ -422,6 +414,9 @@ def main():
     val_out   = np.concatenate([ind_out, ood_out])
     val_label = np.concatenate([np.zeros(len(ind_out)), np.ones(len(ood_out))])
 
+    print(f"anomaly_score min: {anomaly_scores.min():.4f}, max: {anomaly_scores.max():.4f}, std: {anomaly_scores.std():.4f}")
+
+    
     auprc = average_precision_score(val_label, val_out)
     fpr   = fpr_at_95_tpr(val_out, val_label)
 

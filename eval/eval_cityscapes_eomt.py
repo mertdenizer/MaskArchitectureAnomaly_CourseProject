@@ -16,7 +16,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'eomt'))
 
 from dataset import cityscapes
 from transform import ToLabel, Relabel
-from evalAnomaly_eomt import load_eomt, masks_to_pixel_logits
+from evalAnomaly_eomt import load_eomt_coco, coco_masks_to_pixel_logits
 
 device = torch.device('cuda' if torch.cuda.is_available() else ('mps' if torch.backends.mps.is_available() else 'cpu'))
 
@@ -42,48 +42,69 @@ raw_to_train_array[32] = 17
 raw_to_train_array[33] = 18
 
 COCO_TO_CITYSCAPES_MAP = {
-    0: 11,
-    1: 18,
-    2: 13,
-    3: 17,
-    5: 15,
-    6: 16,
-    7: 14,
+    0: 11, # person
+    1: 12, # bicycle
+    2: 13, # car
+    3: 14, # motorcycle
+    5: 15, # bus
+    6: 16, # train
+    7: 17, # truck
     115: 0,
     116: 1,
-    129: 2,
-    130: 3,
+    117: 8,
+    118: 8,
+    119: 10,  # sky-other - sky
+    120: 10,  # clouds - sky
+    121: 2,   # building-other - building
+    122: 2,   # house - building
+    123: 4,   # fence - fence
+    124: 10,  # sky - sky
+    125: 10,  # sky-other
+    126: 9,   # grass - terrain
+    127: 9,   # dirt - terrain
+    128: 9,   # sand - terrain
+    129: 2,   # building
+    130: 3,   # wall
     131: 8,
-    125: 10,
+    132: 8,
+    4:   15,
+    8:   16,
 }
 
 mapping_array = np.full(134, 19, dtype=np.int64)
 for coco_id, city_id in COCO_TO_CITYSCAPES_MAP.items():
-    mapping_array[coco_id] = city_id
+    if coco_id < 134:
+        mapping_array[coco_id] = city_id
 
+COCO_NUM_SEMANTIC = 133
 
 def main(args):
     print(f"Loading EoMT Model with config: {args.config}")
-    model, img_size = load_eomt(args.config)
+    model, img_size = load_eomt_coco(args.config, device)
     model.eval()
 
-    input_transform = Compose([Resize((512, 1024), Image.BILINEAR), ToTensor()])
-    target_transform = Compose([Resize((512, 1024), Image.NEAREST), ToLabel(), Relabel(255, 19)])
+    model_size = (img_size, img_size)
+    label_size = (512, 1024)
+    input_transform = Compose([Resize(model_size, Image.BILINEAR), ToTensor()])
+    target_transform = Compose([Resize(label_size, Image.NEAREST), ToLabel(), Relabel(255, 19)])
 
     loader = DataLoader(
         cityscapes(args.datadir, input_transform, target_transform, subset='val'),
-        batch_size=1, shuffle=False, num_workers=2
+        batch_size=1, shuffle=False, num_workers=0
     )
 
     iou_metric = MulticlassJaccardIndex(num_classes=20, ignore_index=19).to(device)
 
+    print(f"Model input size : {model_size}")
+    print(f"Label/eval size  : {label_size}")
     print("Starting In-Distribution Validation Loop...")
     with torch.no_grad():
         for step, (images, raw_labels, _, _) in enumerate(loader):
+    
             images = images.to(device)
             
-            labels_np = raw_labels.squeeze(1).numpy()
-            labels = torch.from_numpy(raw_to_train_array[labels_np]).to(device)
+            labels_np = raw_labels.squeeze().numpy()
+            labels = torch.from_numpy(raw_to_train_array[labels_np]).unsqueeze(0).to(device)
 
             imgs_uint8 = [(images[0] * 255).to(torch.uint8)]
             img_sizes = [imgs_uint8[0].shape[-2:]]
@@ -94,13 +115,29 @@ def main(args):
             mask_logits = F.interpolate(mask_logits_layer[-1], size=img_sizes[0], mode='bilinear').squeeze(0)
             class_logits = class_logits_layer[-1].squeeze(0)
             mask_logits = model.revert_resize_and_pad_logits_instance_panoptic(mask_logits.unsqueeze(0), img_sizes)[0]
-
-            pixel_logits = masks_to_pixel_logits(mask_logits, class_logits)
-
-            coco_pred = torch.argmax(pixel_logits, dim=0).cpu().numpy()
-            city_pred = torch.from_numpy(mapping_array[coco_pred]).to(device).unsqueeze(0)
-
-            iou_metric.update(city_pred, labels)
+            
+            pixel_logits = coco_masks_to_pixel_logits(mask_logits, class_logits)
+            n_cls = pixel_logits.shape[0]
+            
+            semantic_logits = pixel_logits[:COCO_NUM_SEMANTIC]
+            coco_pred = torch.argmax(semantic_logits, dim=0).cpu().numpy()
+            
+            city_pred_np = mapping_array[coco_pred] 
+            city_pred_t  = torch.from_numpy(city_pred_np).unsqueeze(0).unsqueeze(0).float()
+            city_pred_t  = F.interpolate(city_pred_t, size=label_size, mode='nearest').squeeze(0).long().to(device)     
+            
+            
+            if step == 0:
+                unique_preds = np.unique(coco_pred)
+                mapped_valid = sum(1 for x in unique_preds if mapping_array[x] != 19)
+                print(f"  [step 0] Unique COCO ids predicted : {unique_preds}")
+                print(f"  [step 0] Map to non-ignore classes : {mapped_valid}/{len(unique_preds)}")
+                print(f"  [step 0] pixel_logits shape        : {pixel_logits.shape}")
+                print(f"  [step 0] semantic_logits shape     : {semantic_logits.shape}")
+                print(f"  [step 0] city_pred unique train ids: {torch.unique(city_pred_t).tolist()}")
+            
+            
+            iou_metric.update(city_pred_t, labels)
 
             if step % 50 == 0:
                 print(f"  Processed {step}/{len(loader)} frames...")
