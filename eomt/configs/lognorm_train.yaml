@@ -1,0 +1,10 @@
+trainer:
+  max_epochs: 1
+  accelerator: mps
+  devices: 1
+  precision: 16-mixed
+data:
+  init_args:
+    path: /Users/derinyilmaz/Desktop/MaskArchitectureAnomaly_CourseProject/Cityscapes
+    batch_size: 1
+    num_workers: 2

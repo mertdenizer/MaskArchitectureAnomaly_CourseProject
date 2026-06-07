@@ -96,6 +96,15 @@ class MaskClassificationLoss(Mask2FormerLoss):
 
         return loss_masks
 
+    def loss_labels(self, class_queries_logits, class_labels, indices):
+        logit_norm_t = 0.04
+        class_queries_logits_normalized = (
+            torch.nn.functional.normalize(class_queries_logits, dim=-1) / logit_norm_t
+        )
+        return super().loss_labels(
+            class_queries_logits_normalized, class_labels, indices
+        )
+        
     def loss_total(self, losses_all_layers, log_fn) -> torch.Tensor:
         loss_total = None
         for loss_key, loss in losses_all_layers.items():
