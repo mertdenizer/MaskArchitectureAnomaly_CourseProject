@@ -594,7 +594,6 @@ class LightningModule(lightning.LightningModule):
         buf.seek(0)
 
         block_postfix = self.block_postfix(block_idx)
-        name = f"{log_prefix}_pred_{batch_idx}{block_postfix}"
         if hasattr(self.trainer.logger.experiment, 'log'):
             self.trainer.logger.experiment.log({name: [wandb.Image(Image.open(buf))]})
         else:
